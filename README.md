@@ -7,6 +7,34 @@
 
 ![GitHub last commit (branch)](https://img.shields.io/github/last-commit/opengoofy/hippo4j/develop?color=orange)
 
+## 本仓库的改造说明
+
+本仓库基于 [nageoffer/shortlink](https://github.com/nageoffer/shortlink) 做了以下改造（课程作业）：
+
+1. **Caffeine 本地缓存 + Redis 两级缓存**：跳转时先查本地缓存，未命中再查 Redis；本地缓存的存活时间取「配置上限（默认 60 秒）」与「链接剩余有效期」的较小值。
+2. **本地缓存失效广播**：修改链接、移入回收站时，通过 Redis Pub/Sub 通知所有节点清除本地缓存。
+3. **点击上限**：创建、修改接口新增 `clickLimit`（0 或不传表示不限制）；用 Redis Lua 脚本先判断再自增，不会超发；达到上限后跳转到未找到页面。16 张 `t_link_N` 分表新增 `click_limit` 字段，已同步到 `resources/database/link.sql`。
+4. **压测与验证脚本**：见 `resources/loadtest/`（k6 压测脚本、基线与对照数据 `baseline.md`、失效广播与点击上限的验证脚本）。
+
+可选启动参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--short-link.local-cache.enable` | true | 是否启用本地缓存 |
+| `--short-link.local-cache.ttl-seconds` | 60 | 本地缓存最长存活时间 |
+| `--short-link.local-cache.maximum-size` | 10000 | 本地缓存最大条数 |
+| `--short-link.stats.enable` | true | 是否记录访问统计（仅用于压测对比） |
+| `--short-link.flow-limit.enable` | true | 用户级限流（压测时需要关闭） |
+
+### 本地运行前的配置
+
+出于安全考虑，仓库里的密码均为占位符，运行前请改成你自己的：
+
+- MySQL：`admin`、`aggregation`、`project` 三个模块下的 `shardingsphere-config-dev.yaml`（生产用 `-prod.yaml`）里的 `password: your_mysql_password`
+- Redis：`admin`、`aggregation`、`project`、`gateway` 四个模块 `application.yaml` 里的 `password: your_redis_password`
+
+建议使用 JDK 17（JDK 25 与项目使用的 Lombok 不兼容）。Maven 编译时请指定 `-Dproject.build.sourceEncoding=UTF-8`。
+
 ## 简介
 
 ![](https://oss.open8gu.com/image-20231115133642504.png)
