@@ -29,6 +29,9 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.nageoffer.shortlink.project.cache.ShortLinkCacheInvalidator;
+import com.nageoffer.shortlink.project.cache.ShortLinkClickLimiter;
+import com.nageoffer.shortlink.project.cache.ShortLinkLocalCache;
 import com.nageoffer.shortlink.project.common.convention.exception.ClientException;
 import com.nageoffer.shortlink.project.common.convention.exception.ServiceException;
 import com.nageoffer.shortlink.project.common.enums.VailDateTypeEnum;
@@ -86,6 +89,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static com.nageoffer.shortlink.project.common.constant.RedisKeyConstant.CLICK_LIMIT_SHORT_LINK_KEY;
 import static com.nageoffer.shortlink.project.common.constant.RedisKeyConstant.GOTO_IS_NULL_SHORT_LINK_KEY;
 import static com.nageoffer.shortlink.project.common.constant.RedisKeyConstant.GOTO_SHORT_LINK_KEY;
 import static com.nageoffer.shortlink.project.common.constant.RedisKeyConstant.LOCK_GID_UPDATE_KEY;
@@ -109,15 +113,25 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
     private final RedissonClient redissonClient;
     private final ShortLinkStatsSaveProducer shortLinkStatsSaveProducer;
     private final GotoDomainWhiteListConfiguration gotoDomainWhiteListConfiguration;
+    private final ShortLinkLocalCache shortLinkLocalCache;
+    private final ShortLinkCacheInvalidator shortLinkCacheInvalidator;
+    private final ShortLinkClickLimiter shortLinkClickLimiter;
 
     @Value("${short-link.domain.default}")
     private String createShortLinkDefaultDomain;
+
+    /**
+     * 是否记录访问统计，仅用于压测时对比各项开销，默认开启
+     */
+    @Value("${short-link.stats.enable:true}")
+    private boolean statsEnable;
 
     @Transactional(rollbackFor = Exception.class)
     @Override
     public ShortLinkCreateRespDTO createShortLink(ShortLinkCreateReqDTO requestParam) {
         // 短链接接口的并发量有多少？如何测试？详情查看：https://nageoffer.com/shortlink/question
         verificationWhitelist(requestParam.getOriginUrl());
+        int clickLimit = resolveClickLimit(requestParam.getClickLimit());
         String shortLinkSuffix = generateSuffix(requestParam);
         String fullShortUrl = StrBuilder.create(createShortLinkDefaultDomain)
                 .append("/")
@@ -131,6 +145,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
                 .validDateType(requestParam.getValidDateType())
                 .validDate(requestParam.getValidDate())
                 .describe(requestParam.getDescribe())
+                .clickLimit(clickLimit)
                 .shortUri(shortLinkSuffix)
                 .enableStatus(0)
                 .totalPv(0)
@@ -157,11 +172,13 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
             throw new ServiceException(String.format("短链接：%s 生成重复", fullShortUrl));
         }
         // 项目中短链接缓存预热是怎么做的？详情查看：https://nageoffer.com/shortlink/question
+        long linkCacheValidTime = LinkUtil.getLinkCacheValidTime(requestParam.getValidDate());
         stringRedisTemplate.opsForValue().set(
                 String.format(GOTO_SHORT_LINK_KEY, fullShortUrl),
                 requestParam.getOriginUrl(),
-                LinkUtil.getLinkCacheValidTime(requestParam.getValidDate()), TimeUnit.MILLISECONDS
+                linkCacheValidTime, TimeUnit.MILLISECONDS
         );
+        shortLinkClickLimiter.warmUp(fullShortUrl, clickLimit, 0, linkCacheValidTime);
         // 删除短链接后，布隆过滤器如何删除？详情查看：https://nageoffer.com/shortlink/question
         shortUriCreateCachePenetrationBloomFilter.add(fullShortUrl);
         return ShortLinkCreateRespDTO.builder()
@@ -174,6 +191,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
     @Override
     public ShortLinkCreateRespDTO createShortLinkByLock(ShortLinkCreateReqDTO requestParam) {
         verificationWhitelist(requestParam.getOriginUrl());
+        int clickLimit = resolveClickLimit(requestParam.getClickLimit());
         String fullShortUrl;
         // 为什么说布隆过滤器性能远胜于分布式锁？详情查看：https://nageoffer.com/shortlink/question
         RLock lock = redissonClient.getLock(SHORT_LINK_CREATE_LOCK_KEY);
@@ -192,6 +210,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
                     .validDateType(requestParam.getValidDateType())
                     .validDate(requestParam.getValidDate())
                     .describe(requestParam.getDescribe())
+                    .clickLimit(clickLimit)
                     .shortUri(shortLinkSuffix)
                     .enableStatus(0)
                     .totalPv(0)
@@ -211,11 +230,13 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
             } catch (DuplicateKeyException ex) {
                 throw new ServiceException(String.format("短链接：%s 生成重复", fullShortUrl));
             }
+            long linkCacheValidTime = LinkUtil.getLinkCacheValidTime(requestParam.getValidDate());
             stringRedisTemplate.opsForValue().set(
                     String.format(GOTO_SHORT_LINK_KEY, fullShortUrl),
                     requestParam.getOriginUrl(),
-                    LinkUtil.getLinkCacheValidTime(requestParam.getValidDate()), TimeUnit.MILLISECONDS
+                    linkCacheValidTime, TimeUnit.MILLISECONDS
             );
+            shortLinkClickLimiter.warmUp(fullShortUrl, clickLimit, 0, linkCacheValidTime);
         } finally {
             lock.unlock();
         }
@@ -257,6 +278,8 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
     @Override
     public void updateShortLink(ShortLinkUpdateReqDTO requestParam) {
         verificationWhitelist(requestParam.getOriginUrl());
+        // 为空表示不修改点击上限，0 表示取消限制
+        Integer newClickLimit = requestParam.getClickLimit() == null ? null : resolveClickLimit(requestParam.getClickLimit());
         LambdaQueryWrapper<ShortLinkDO> queryWrapper = Wrappers.lambdaQuery(ShortLinkDO.class)
                 .eq(ShortLinkDO::getGid, requestParam.getOriginGid())
                 .eq(ShortLinkDO::getFullShortUrl, requestParam.getFullShortUrl())
@@ -281,6 +304,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
                     .gid(requestParam.getGid())
                     .originUrl(requestParam.getOriginUrl())
                     .describe(requestParam.getDescribe())
+                    .clickLimit(newClickLimit)
                     .validDateType(requestParam.getValidDateType())
                     .validDate(requestParam.getValidDate())
                     .build();
@@ -310,6 +334,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
                         .validDateType(requestParam.getValidDateType())
                         .validDate(requestParam.getValidDate())
                         .describe(requestParam.getDescribe())
+                        .clickLimit(newClickLimit != null ? newClickLimit : hasShortLinkDO.getClickLimit())
                         .shortUri(hasShortLinkDO.getShortUri())
                         .enableStatus(hasShortLinkDO.getEnableStatus())
                         .totalPv(hasShortLinkDO.getTotalPv())
@@ -334,8 +359,11 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
         // 短链接如何保障缓存和数据库一致性？详情查看：https://nageoffer.com/shortlink/question
         if (!Objects.equals(hasShortLinkDO.getValidDateType(), requestParam.getValidDateType())
                 || !Objects.equals(hasShortLinkDO.getValidDate(), requestParam.getValidDate())
-                || !Objects.equals(hasShortLinkDO.getOriginUrl(), requestParam.getOriginUrl())) {
+                || !Objects.equals(hasShortLinkDO.getOriginUrl(), requestParam.getOriginUrl())
+                || (newClickLimit != null && !Objects.equals(Optional.ofNullable(hasShortLinkDO.getClickLimit()).orElse(0), newClickLimit))) {
             stringRedisTemplate.delete(String.format(GOTO_SHORT_LINK_KEY, requestParam.getFullShortUrl()));
+            shortLinkClickLimiter.clearLimit(requestParam.getFullShortUrl());
+            shortLinkCacheInvalidator.invalidate(requestParam.getFullShortUrl());
             Date currentDate = new Date();
             if (hasShortLinkDO.getValidDate() != null && hasShortLinkDO.getValidDate().before(currentDate)) {
                 if (Objects.equals(requestParam.getValidDateType(), VailDateTypeEnum.PERMANENT.getType()) || requestParam.getValidDate().after(currentDate)) {
@@ -380,10 +408,16 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
                 .map(each -> ":" + each)
                 .orElse("");
         String fullShortUrl = serverName + serverPort + "/" + shortUri;
-        String originalLink = stringRedisTemplate.opsForValue().get(String.format(GOTO_SHORT_LINK_KEY, fullShortUrl));
-        if (StrUtil.isNotBlank(originalLink)) {
-            shortLinkStats(buildLinkStatsRecordAndSetUser(fullShortUrl, request, response));
-            ((HttpServletResponse) response).sendRedirect(originalLink);
+        ShortLinkLocalCache.CachedLink cachedLink = shortLinkLocalCache.get(fullShortUrl);
+        if (cachedLink != null) {
+            Boolean passed = shortLinkClickLimiter.tryAcquire(fullShortUrl, cachedLink.clickLimit());
+            if (passed != null) {
+                redirectByClickLimit(passed, cachedLink.originUrl(), fullShortUrl, request, response);
+                return;
+            }
+            // 计数器丢失，丢弃本地缓存并回源重新初始化
+            shortLinkLocalCache.invalidate(fullShortUrl);
+        } else if (serveFromRedis(fullShortUrl, request, response)) {
             return;
         }
         boolean contains = shortUriCreateCachePenetrationBloomFilter.contains(fullShortUrl);
@@ -399,10 +433,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
         RLock lock = redissonClient.getLock(String.format(LOCK_GOTO_SHORT_LINK_KEY, fullShortUrl));
         lock.lock();
         try {
-            originalLink = stringRedisTemplate.opsForValue().get(String.format(GOTO_SHORT_LINK_KEY, fullShortUrl));
-            if (StrUtil.isNotBlank(originalLink)) {
-                shortLinkStats(buildLinkStatsRecordAndSetUser(fullShortUrl, request, response));
-                ((HttpServletResponse) response).sendRedirect(originalLink);
+            if (serveFromRedis(fullShortUrl, request, response)) {
                 return;
             }
             gotoIsNullShortLink = stringRedisTemplate.opsForValue().get(String.format(GOTO_IS_NULL_SHORT_LINK_KEY, fullShortUrl));
@@ -429,15 +460,75 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
                 ((HttpServletResponse) response).sendRedirect("/page/notfound");
                 return;
             }
+            long linkCacheValidTime = LinkUtil.getLinkCacheValidTime(shortLinkDO.getValidDate());
+            int clickLimit = Optional.ofNullable(shortLinkDO.getClickLimit()).orElse(0);
             stringRedisTemplate.opsForValue().set(
                     String.format(GOTO_SHORT_LINK_KEY, fullShortUrl),
                     shortLinkDO.getOriginUrl(),
-                    LinkUtil.getLinkCacheValidTime(shortLinkDO.getValidDate()), TimeUnit.MILLISECONDS
+                    linkCacheValidTime, TimeUnit.MILLISECONDS
             );
-            shortLinkStats(buildLinkStatsRecordAndSetUser(fullShortUrl, request, response));
-            ((HttpServletResponse) response).sendRedirect(shortLinkDO.getOriginUrl());
+            // 计数器以数据库中的历史 PV 作为初值，统计是异步入库的，重建计数器时可能少算少量次数
+            shortLinkClickLimiter.warmUp(fullShortUrl, clickLimit, Optional.ofNullable(shortLinkDO.getTotalPv()).orElse(0), linkCacheValidTime);
+            shortLinkLocalCache.put(fullShortUrl, shortLinkDO.getOriginUrl(), clickLimit, linkCacheValidTime);
+            Boolean passed = shortLinkClickLimiter.tryAcquire(fullShortUrl, clickLimit);
+            redirectByClickLimit(passed == null || passed, shortLinkDO.getOriginUrl(), fullShortUrl, request, response);
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * 尝试从 Redis 缓存中完成跳转，需要跳转链接和点击上限两个缓存同时存在且计数器可用，否则返回 false 交给回源流程
+     */
+    @SneakyThrows
+    private boolean serveFromRedis(String fullShortUrl, ServletRequest request, ServletResponse response) {
+        String gotoKey = String.format(GOTO_SHORT_LINK_KEY, fullShortUrl);
+        List<String> cached = stringRedisTemplate.opsForValue()
+                .multiGet(List.of(gotoKey, String.format(CLICK_LIMIT_SHORT_LINK_KEY, fullShortUrl)));
+        if (cached == null || StrUtil.isBlank(cached.get(0)) || StrUtil.isBlank(cached.get(1))) {
+            return false;
+        }
+        String originalLink = cached.get(0);
+        int clickLimit = Integer.parseInt(cached.get(1));
+        Boolean passed = shortLinkClickLimiter.tryAcquire(fullShortUrl, clickLimit);
+        if (passed == null) {
+            return false;
+        }
+        // Redis 里的剩余存活时间就是链接剩余有效期，-1 表示永久有效
+        Long redisTtlMillis = stringRedisTemplate.getExpire(gotoKey, TimeUnit.MILLISECONDS);
+        if (redisTtlMillis != null && redisTtlMillis != -2L) {
+            shortLinkLocalCache.put(fullShortUrl, originalLink, clickLimit, redisTtlMillis == -1L ? Long.MAX_VALUE : redisTtlMillis);
+        }
+        redirectByClickLimit(passed, originalLink, fullShortUrl, request, response);
+        return true;
+    }
+
+    /**
+     * 未达点击上限则记录统计并跳转，已达上限跳转到未找到页面
+     */
+    @SneakyThrows
+    private void redirectByClickLimit(boolean passed, String originUrl, String fullShortUrl, ServletRequest request, ServletResponse response) {
+        if (!passed) {
+            ((HttpServletResponse) response).sendRedirect("/page/notfound");
+            return;
+        }
+        recordStats(fullShortUrl, request, response);
+        ((HttpServletResponse) response).sendRedirect(originUrl);
+    }
+
+    private int resolveClickLimit(Integer clickLimit) {
+        if (clickLimit == null) {
+            return 0;
+        }
+        if (clickLimit < 0) {
+            throw new ClientException("点击上限不能小于 0");
+        }
+        return clickLimit;
+    }
+
+    private void recordStats(String fullShortUrl, ServletRequest request, ServletResponse response) {
+        if (statsEnable) {
+            shortLinkStats(buildLinkStatsRecordAndSetUser(fullShortUrl, request, response));
         }
     }
 

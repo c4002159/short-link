@@ -69,6 +69,11 @@ public class ShortLinkDO extends BaseDO {
     private Integer clickNum;
 
     /**
+     * 点击上限 0 或空：不限制
+     */
+    private Integer clickLimit;
+
+    /**
      * 分组标识
      */
     private String gid;

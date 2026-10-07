@@ -69,6 +69,21 @@ public class RedisKeyConstant {
     public static final String SHORT_LINK_STATS_STREAM_GROUP_KEY = "short-link:stats-stream:only-group";
 
     /**
+     * 短链接点击上限缓存 Key，值为上限次数，0 表示不限制
+     */
+    public static final String CLICK_LIMIT_SHORT_LINK_KEY = "short-link:click-limit:%s";
+
+    /**
+     * 短链接已点击次数计数器 Key
+     */
+    public static final String CLICK_COUNT_SHORT_LINK_KEY = "short-link:click-count:%s";
+
+    /**
+     * 短链接本地缓存失效广播 Channel
+     */
+    public static final String SHORT_LINK_LOCAL_CACHE_INVALIDATE_CHANNEL = "short-link:local-cache:invalidate";
+
+    /**
      * 创建短链接锁标识
      */
     public static final String SHORT_LINK_CREATE_LOCK_KEY = "short-link:lock:create";

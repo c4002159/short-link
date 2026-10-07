@@ -97,6 +97,11 @@ public class ShortLinkPageRespDTO {
     private Integer totalPv;
 
     /**
+     * 点击上限 0 或空：不限制
+     */
+    private Integer clickLimit;
+
+    /**
      * 今日PV
      */
     private Integer todayPv;

@@ -64,4 +64,9 @@ public class ShortLinkUpdateReqDTO {
      * 描述
      */
     private String describe;
+
+    /**
+     * 点击上限 0：取消限制，空：不修改
+     */
+    private Integer clickLimit;
 }

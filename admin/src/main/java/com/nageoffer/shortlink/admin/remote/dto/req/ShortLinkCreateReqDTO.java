@@ -64,4 +64,9 @@ public class ShortLinkCreateReqDTO {
      * 描述
      */
     private String describe;
+
+    /**
+     * 点击上限 0 或空：不限制
+     */
+    private Integer clickLimit;
 }
