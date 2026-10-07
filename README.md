@@ -100,9 +100,4 @@ URL。短链接通常只包含几个字符，而原始的长 URL 可能会非常
 
 项目实现过程中会充分考虑以上问题，最终实现高可用、可扩展、支持海并发以及存储的 SaaS 短链接系统。
 
-
-
-
-短链接视频学习地址：[手摸手视频学习SaaS短链接项目](https://nageoffer.com/shortlink/video/)
-
 ![](https://oss.open8gu.com/image-20231122173916783.png)
